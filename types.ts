@@ -34,6 +34,7 @@ export interface ConversionFile {
   progress: number;
   etaSeconds?: number | null;
   convertedFileUrl: string | null;
+  convertedBlob: Blob | null;
   error: string | null;
   relativePath?: string;
 }

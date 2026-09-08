@@ -611,6 +611,7 @@ const App: React.FC = () => {
         readProgress: 0,
         progress: 0,
         convertedFileUrl: null,
+        convertedBlob: null,
         error: null,
         relativePath: relativePath,
       };
@@ -719,6 +720,7 @@ const App: React.FC = () => {
             status: 'success',
             targetFormat: ConversionTarget.PDF,
             convertedFileUrl: url,
+            convertedBlob: combinedPdfBlob,
             progress: 100, readProgress: 100, error: null,
         };
         setFiles(prev => [combinedFileEntry, ...prev]);
@@ -818,7 +820,7 @@ const App: React.FC = () => {
           await electronApi.writeOutputFile(outputPath, await convertedBlob.arrayBuffer());
           if (deleteSources && sourcePath) await electronApi.deleteSourceFile(sourcePath);
         }
-        updateFileState(id, { convertedFileUrl: url, status: 'success', progress: 100 });
+        updateFileState(id, { convertedFileUrl: url, convertedBlob: convertedBlob, status: 'success', progress: 100 });
         conversionTimings.push({ fileName: file.name, seconds: (performance.now() - conversionStartedAt) / 1000, status: 'success' });
       } catch (err: any) {
         const message = String(err);
@@ -867,14 +869,14 @@ const App: React.FC = () => {
   const retryFile = useCallback((id: string) => {
     if (isConverting) return;
     setFiles(prev => prev.map(file => file.id === id
-      ? { ...file, status: 'pending', progress: 0, readProgress: 0, error: null, convertedFileUrl: null }
+      ? { ...file, status: 'pending', progress: 0, readProgress: 0, error: null, convertedFileUrl: null, convertedBlob: null }
       : file));
   }, [isConverting]);
 
   const retryFailed = useCallback(() => {
     if (isConverting) return;
     setFiles(prev => prev.map(file => file.status === 'error'
-      ? { ...file, status: 'pending', progress: 0, readProgress: 0, error: null, convertedFileUrl: null }
+      ? { ...file, status: 'pending', progress: 0, readProgress: 0, error: null, convertedFileUrl: null, convertedBlob: null }
       : file));
   }, [isConverting]);
   
@@ -962,59 +964,82 @@ const App: React.FC = () => {
     try {
         zipWriter = new ZipWriter(new BlobWriter("application/zip"));
         const usedPaths = new Set<string>();
+        const batchSize = 50;
+        let processedCount = 0;
 
-        for (let fileIndex = 0; fileIndex < successfulConversions.length; fileIndex++) {
-          const fileItem = successfulConversions[fileIndex];
+        const resolveConvertedBlob = async (fileItem: typeof successfulConversions[number]) => {
+          if (fileItem.convertedBlob) return fileItem.convertedBlob;
+          if (!fileItem.convertedFileUrl) {
+            throw new Error(`No converted file is available for ${fileItem.file.name}`);
+          }
+
+          const res = await fetch(fileItem.convertedFileUrl);
+          if (!res.ok) throw new Error(`Fetch failed with status ${res.status}`);
+          return res.blob();
+        };
+
+        for (let batchStart = 0; batchStart < successfulConversions.length; batchStart += batchSize) {
+          const batch = successfulConversions.slice(batchStart, batchStart + batchSize);
+          const preparedEntries: Array<{ fileItem: typeof successfulConversions[number]; finalFileName: string; blob: Blob }> = [];
+
+          for (const fileItem of batch) {
             const path = fileItem.relativePath || fileItem.file.name;
             const normalizedPath = path.replace(/\\/g, '/');
-          setZipProgress({ completed: fileIndex, total: successfulConversions.length, currentFile: fileItem.file.name });
-            
+            setZipProgress({ completed: processedCount, total: successfulConversions.length, currentFile: fileItem.file.name });
+
             const lastDotIndex = normalizedPath.lastIndexOf('.');
             const pathWithoutExt = lastDotIndex === -1 ? normalizedPath : normalizedPath.substring(0, lastDotIndex);
             const targetExt = fileItem.targetFormat?.toLowerCase() || 'dat';
             const baseFileName = `${pathWithoutExt}.${targetExt}`;
-            
+
             let finalFileName = baseFileName;
             let counter = 1;
 
-            // Ensure uniqueness in our own tracking set
             while (usedPaths.has(finalFileName)) {
-                 const dotIndex = baseFileName.lastIndexOf('.');
-                 if (dotIndex !== -1) {
-                     finalFileName = `${baseFileName.substring(0, dotIndex)} (${counter})${baseFileName.substring(dotIndex)}`;
-                 } else {
-                     finalFileName = `${baseFileName} (${counter})`;
-                 }
-                 counter++;
+              const dotIndex = baseFileName.lastIndexOf('.');
+              if (dotIndex !== -1) {
+                finalFileName = `${baseFileName.substring(0, dotIndex)} (${counter})${baseFileName.substring(dotIndex)}`;
+              } else {
+                finalFileName = `${baseFileName} (${counter})`;
+              }
+              counter++;
             }
 
-            try {
-              const res = await fetch(fileItem.convertedFileUrl!);
-              if (!res.ok) throw new Error(`Fetch failed with status ${res.status}`);
-              const blob = await res.blob();
-              const blobReader = new BlobReader(blob);
+            preparedEntries.push({
+              fileItem,
+              finalFileName,
+              blob: await resolveConvertedBlob(fileItem),
+            });
+          }
 
+          for (const entry of preparedEntries) {
+            try {
+              const blobReader = new BlobReader(entry.blob);
               const options: any = {
                 onprogress: (loaded: number, total: number) => {
                   if (!total) return;
                   setZipProgress({
-                    completed: fileIndex + loaded / total,
+                    completed: processedCount + loaded / total,
                     total: successfulConversions.length,
-                    currentFile: fileItem.file.name,
+                    currentFile: entry.fileItem.file.name,
                   });
                 },
               };
+
               if (password) {
                 options.password = password;
                 options.encryption = "AES-256";
               }
 
-              await zipWriter.add(finalFileName, blobReader, options);
-              usedPaths.add(finalFileName);
+              await zipWriter.add(entry.finalFileName, blobReader, options);
+              usedPaths.add(entry.finalFileName);
             } catch (error: any) {
-              console.error(`Failed to add ${fileItem.file.name} to zip:`, error);
+              console.error(`Failed to add ${entry.fileItem.file.name} to zip:`, error);
             }
-            setZipProgress({ completed: fileIndex + 1, total: successfulConversions.length, currentFile: fileItem.file.name });
+
+            processedCount += 1;
+            setZipProgress({ completed: processedCount, total: successfulConversions.length, currentFile: entry.fileItem.file.name });
+          }
         }
 
         setZipProgress({ completed: successfulConversions.length, total: successfulConversions.length, currentFile: 'ZIP afronden...' });
