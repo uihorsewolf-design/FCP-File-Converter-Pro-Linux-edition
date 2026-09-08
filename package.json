@@ -74,7 +74,7 @@
         "deb"
       ],
       "category": "Utility",
-      "icon": "assets/icon.ico",
+      "icon": "assets/icon.png",
       "executableName": "file-converter-pro",
       "artifactName": "File-Converter-Pro-${version}-${arch}.${ext}"
     }
